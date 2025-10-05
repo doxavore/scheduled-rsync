@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_ID="com.doxavore.scheduled-rsync"
+APP_NAME="scheduled-rsync"
+
+: "${HOME:?}"
+LOG_DIR="$HOME/Library/Logs/$APP_ID"
+STATE_DIR="$HOME/Library/Application Support/$APP_ID"
+STATE_LOG_FILE="$STATE_DIR/run.log"
+TIMESTAMP_FILE="$STATE_DIR/last_success.txt"
+
+mkdir -p "$LOG_DIR" "$STATE_DIR"
+
+LOG_FILE="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+ln -sf "$LOG_FILE" "$STATE_LOG_FILE"
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: $APP_NAME DESTINATION[:path] DIR [DIR ...]" >&2
+  echo "Example: $APP_NAME user@nas.example.com: Desktop Documents" >&2
+  exit 2
+fi
+
+DEST="$1"; shift
+# Normalize destination to end with ":" (ssh rsync target shorthand)
+if [[ "$DEST" != *:* ]]; then
+  DEST="${DEST}:"
+fi
+
+DIRS=( "$@" )
+
+# Email recipient: required for failure mail.
+# Allow env override (MAIL_TO), otherwise read from install-time default (if baked in by installer).
+MAIL_TO="${MAIL_TO:-__MAIL_TO_PLACEHOLDER__}"
+# Optional explicit sender for Mail.app ("Full Name <email@domain>")
+MAIL_FROM="${MAIL_FROM:-}"
+
+# Rsync flags: keep conservative; override by env if you need more.
+RSYNC_FLAGS_DEFAULT=(-avh --mkpath --delete-after --stats)
+if [[ -n "${RSYNC_FLAGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  RSYNC_FLAGS=( ${RSYNC_FLAGS} )
+else
+  RSYNC_FLAGS=( "${RSYNC_FLAGS_DEFAULT[@]}" )
+fi
+
+computer_name="$(scutil --get ComputerName 2>/dev/null || hostname)"
+echo "==== $(date +"%Y-%m-%dT%H:%M:%S%z") $APP_NAME start on $computer_name ===="
+echo "Destination: $DEST"
+echo "Dirs: ${DIRS[*]}"
+echo "Log: $LOG_FILE"
+
+fail=0
+
+notify_persistent() {
+  local title="$1"; shift
+  local message="$*"
+
+  /usr/bin/osascript - "$title" "$message" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+  set theTitle to item 1 of argv
+  set theMsg to item 2 of argv
+  display alert theTitle message theMsg as critical
+end run
+APPLESCRIPT
+}
+
+send_mail() {
+  local to="$1"; shift
+  local subject="$1"; shift
+  local body="$*"
+
+  /usr/bin/osascript - "$to" "$subject" "$body" "$MAIL_FROM" <<'APPLESCRIPT'
+on run argv
+  set recip to item 1 of argv
+  set subj  to item 2 of argv
+  set bod   to item 3 of argv
+  set sndr  to item 4 of argv -- may be empty or "Name <addr>" or just "addr"
+
+  tell application "Mail"
+    if sndr is not "" then
+      -- Extract the bare email address
+      set AppleScript's text item delimiters to {"<", ">"}
+      set bare to sndr
+      if sndr contains "<" and sndr contains ">" then
+        set bare to text item 2 of sndr
+      end if
+      set AppleScript's text item delimiters to {""}
+
+      -- Find a matching account by email address (or alias)
+      set acctMatch to missing value
+      repeat with a in accounts
+        if (email addresses of a) contains bare then
+          set acctMatch to a
+          exit repeat
+        end if
+      end repeat
+
+      if acctMatch is missing value then
+        error "MAIL_FROM does not match any Mail account address: " & sndr
+      end if
+
+      -- Normalize the sender string to exactly what Mail expects
+      set normalizedSender to (full name of acctMatch) & " <" & bare & ">"
+    end if
+
+    set msg to make new outgoing message with properties {subject:subj, content:bod & return & return, visible:false}
+    tell msg
+      make new to recipient at end of to recipients with properties {address:recip}
+      if sndr is not "" then set sender to normalizedSender
+    end tell
+    send msg
+  end tell
+end run
+APPLESCRIPT
+}
+
+# Begin real work...
+for rel in "${DIRS[@]}"; do
+  # Disallow absolute paths to keep the contract strict
+  if [[ "$rel" = /* ]]; then
+    echo "ERR: directories must be relative to \$HOME (got: $rel)" >&2
+    fail=1
+    continue
+  fi
+
+  src="$HOME/$rel/"
+  dest="${DEST}${rel}/"
+
+  if [[ ! -d "$src" ]]; then
+    echo "WARN: skipping missing directory $src"
+    continue
+  fi
+
+  echo "+ rsync ${RSYNC_FLAGS[*]} '$src' '$dest'"
+  if ! rsync "${RSYNC_FLAGS[@]}" "$src" "$dest"; then
+    echo "!! rsync failed for $rel"
+    fail=1
+  fi
+done
+
+if [[ $fail -eq 0 ]]; then
+  date +"%Y-%m-%dT%H:%M:%S%z" > "$TIMESTAMP_FILE"
+  echo "OK: wrote timestamp to $TIMESTAMP_FILE"
+  echo "==== $(date +"%Y-%m-%dT%H:%M:%S%z") $APP_NAME finished OK ===="
+  exit 0
+fi
+
+notify_persistent "Backup failed on $computer_name" "See log: $LOG_FILE"
+
+mail_body=$(
+  {
+    echo "One or more rsync operations failed on host \"$computer_name\" at $(date +\"%Y-%m-%dT%H:%M:%S%z\")."
+    echo
+    echo "Destination: $DEST"
+    echo "Dirs: ${DIRS[*]}"
+    echo "Log: $LOG_FILE"
+    echo
+    echo "----- Log excerpt (last 500 lines) -----"
+    tail -n 500 "$LOG_FILE" 2>/dev/null || echo "(no log content available)"
+  } | sed 's/\r$//'  # sanitize line endings for Mail.app
+)
+send_mail "$MAIL_TO" "[$computer_name] $APP_NAME FAILED" "$mail_body"
+
+echo "==== $(date +"%Y-%m-%dT%H:%M:%S%z") $APP_NAME finished with FAILURE ===="
+exit 1
